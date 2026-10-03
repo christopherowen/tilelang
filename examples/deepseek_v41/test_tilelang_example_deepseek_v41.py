@@ -2,6 +2,7 @@ import tilelang.testing
 
 import fp8_fp4_gemm_sm120
 import indexer_sm120
+import moe_dispatch_sm120
 import mxfp8_gemm_sm120
 import sparse_mla_fwd_sm120
 
@@ -10,8 +11,17 @@ import sparse_mla_fwd_sm120
 @tilelang.testing.requires_cuda_compute_version_ge(12, 0)
 @tilelang.testing.requires_cuda_compute_version_lt(13, 0)
 def test_example_sparse_mla_fwd_tp3():
-    # 24 local heads at TP3, padded into one 32-head block; checks decode == extend.
+    # 24 local heads at TP3, padded into one 32-head block; every plan kernel gives the same bits.
     sparse_mla_fwd_sm120.test_sparse_mla_fwd_v41(rows=8, heads=24)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(12, 0)
+@tilelang.testing.requires_cuda_compute_version_lt(13, 0)
+def test_example_sparse_mla_fwd_segments():
+    # One chunk per segment, and segments that do not divide the 20 chunks.
+    sparse_mla_fwd_sm120.test_sparse_mla_fwd_v41(rows=5, heads=24, segment_chunks=1)
+    sparse_mla_fwd_sm120.test_sparse_mla_fwd_v41(rows=5, heads=24, segment_chunks=3)
 
 
 @tilelang.testing.requires_cuda
@@ -65,6 +75,16 @@ def test_example_indexer_candidates():
 @tilelang.testing.requires_cuda_compute_version_lt(13, 0)
 def test_example_indexer_topk_ties_and_blocks():
     indexer_sm120.test_topk_ties_and_blocks()
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(12, 0)
+@tilelang.testing.requires_cuda_compute_version_lt(13, 0)
+def test_example_moe_dispatch():
+    # One CTA (48 rows), chunked (300 rows), padding tokens, a skewed load, and the drafter's 3 of 128.
+    moe_dispatch_sm120.test_moe_dispatch_v41(rows=48)
+    moe_dispatch_sm120.test_moe_dispatch_v41(rows=300, pad_rows=17, skew=4.0)
+    moe_dispatch_sm120.test_moe_dispatch_v41(rows=40, num_experts=128, topk=3)
 
 
 if __name__ == "__main__":

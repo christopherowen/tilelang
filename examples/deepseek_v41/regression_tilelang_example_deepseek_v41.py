@@ -7,11 +7,11 @@ import sparse_mla_fwd_sm120
 
 
 def regression_sparse_mla_fwd_decode():
-    tilelang.testing.process_func(sparse_mla_fwd_sm120.run_regression_perf, rows=8, heads=24, schedule="decode")
+    tilelang.testing.process_func(sparse_mla_fwd_sm120.run_regression_perf, rows=8, heads=24, kernel="decode")
 
 
 def regression_sparse_mla_fwd_extend():
-    tilelang.testing.process_func(sparse_mla_fwd_sm120.run_regression_perf, rows=512, heads=24, schedule="extend")
+    tilelang.testing.process_func(sparse_mla_fwd_sm120.run_regression_perf, rows=512, heads=24, kernel="extend")
 
 
 def regression_mxfp8_gemm():

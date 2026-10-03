@@ -12,6 +12,7 @@ deepseek_v41/
 ├── README.md
 ├── sparse_mla_fwd_sm120.py      # sparse MLA over the SWA (MXFP8) and indexed (NVFP4) caches
 ├── indexer_sm120.py             # indexer scores over the MXFP4 index cache, exact top-k
+├── moe_dispatch_sm120.py        # routed-expert dispatch to the grouped layout, and combine
 ├── mxfp8_gemm_sm120.py          # block-32 FP8 linear: MXFP8 x MXFP8
 ├── fp8_fp4_gemm_sm120.py        # routed-expert linear: MXFP8 x MXFP4
 ├── test_tilelang_example_deepseek_v41.py
@@ -27,10 +28,13 @@ deepseek_v41/
 | Top-512 selection, candidate-domain blocks | `indexer_sm120.py` | radix select in shared memory |
 | Block-32 FP8 projections (query, KV, output, shared expert, Engram) | `mxfp8_gemm_sm120.py` | `mma.sync.m16n8k32.kind::mxf8f6f4.block_scale` E4M3 x E4M3 |
 | Routed experts, one expert's projection | `fp8_fp4_gemm_sm120.py` | `mma.sync.m16n8k32.kind::mxf8f6f4.block_scale` E4M3 x E2M1 |
+| Routed experts, dispatch and combine | `moe_dispatch_sm120.py` | warp match masks, ordered weighted sums |
 | Manifold hyper-connections (4 streams) | `../deepseek_mhc` | architecture-neutral; use `hc_mult=4`, hidden 5120, 20 Sinkhorn iterations |
 | Activation quantization | `../deepseek_v4/act_quant.py` | architecture-neutral |
 
-Routing and the grouped expert launch are not included.
+Expert selection itself (sqrt-softplus scores, biased top-k, normalized
+weights) is TileKernels' `moe_topk_gate_forward`. The grouped expert launch
+is not included.
 
 ## Sparse MLA
 
@@ -42,44 +46,60 @@ same latent):
 | Sliding window (SWA) | 528 bytes | 512 x E4M3 | 16 x UE8M0, one per 32 coordinates |
 | Indexed (top-k selected compressed entries) | 288 bytes | 256 bytes of packed E2M1, low nibble first | 32 x E4M3, one per 16 coordinates |
 
-All 512 coordinates are quantized, RoPE included. The kernel gathers records
-by slot index, dequantizes them into shared memory as BF16 (exactly, for both
-formats), and multiplies on `mma.sync`. An index of `-1`, or a position past
-the row's length, is masked.
+All 512 coordinates are quantized, RoPE included. Each CTA resolves the
+slots it needs up front, then copies the next chunk's raw records into
+shared memory with `cp.async` while the current chunk computes. It
+dequantizes them to BF16 in shared memory (exactly, for both formats) and
+multiplies on `mma.sync`. An index of `-1`, or a position past the row's
+length, is masked and its record zero-filled.
 
-### One contract, two schedules
+### One contract, several kernels
 
-The arithmetic is defined per chunk of `block_I` entries of the concatenated
-[SWA | indexed] list. Each chunk yields its maximum score `m_c`, the sum
-`l_c` of `exp2(s - m_c)`, and the unnormalized `O_c = P V`. The chunks then
-fold in order into a state that starts from the head's sink, using explicit
-`T.fma`/`T.fmul`, and the output is `O * (1 / L)`.
+The arithmetic is defined over chunks of `block_I` entries of the
+concatenated [SWA | indexed] list, grouped into segments of
+`segment_chunks` chunks (default 4: the 128-entry window is one segment).
+Within a segment, chunks update a flash-attention state `(O_g, m_g, l_g)` in
+order. The segment states then fold in order into a state that starts from
+the head's sink, using explicit `T.fma`/`T.fmul`, and the output is
+`O * (1 / L)`.
 
 | Schedule | Grid | Suits |
 |---|---|---|
-| `extend` | one CTA per row and head block; chunks fold in registers | many rows |
-| `decode` | one CTA per chunk, head block and row writes `(O_c, m_c, l_c)`; a merge kernel folds them | few rows: up to `chunks x head_blocks` CTAs per row |
+| `extend` | one CTA per row and head block; segments fold in registers | many rows |
+| `decode` | one CTA per segment, head block and row writes `(O_g, m_g, l_g)`; a merge kernel folds them | few rows: `segments x head_blocks` CTAs per row |
 
-Both schedules run the same chunk code and the same fold, so they produce
-identical bits. The tests check that decode equals extend, and that a row
-gives the same bits alone and in a batch. Choosing a schedule by batch size
+Both schedules run the same segment code and the same fold, so they produce
+identical bits, and so do different head block sizes. `segment_chunks` and
+`block_I` are part of the arithmetic; the schedule and `block_H` are not.
+The tests check that every kernel gives the same bits, and that a row gives
+the same bits alone and in a batch. Choosing a kernel by batch size
 therefore never changes results.
 
-`SparseMlaV41Plan` compiles both schedules once, owns the decode workspace and
-the output, and selects `decode` for batches up to `decode_max_rows`.
-`run(..., schedule=...)` forces either schedule. `run` only launches kernels,
-so it can be captured in a CUDA graph.
+`SparseMlaV41Plan` compiles three kernels for one layer shape and picks one
+by row count:
+
+- `decode` with 16-head blocks while it fits one wave of CTAs;
+- `decode` with `block_H`-head blocks while it needs at most three waves;
+- `extend` above that.
+
+It owns the decode workspace and the output. `run(..., kernel=...)` forces
+a kernel. `run` only launches kernels, so it can be captured in a CUDA
+graph.
 
 ```python
 plan = SparseMlaV41Plan(heads=24, swa_width=128, idx_width=512, idx_page_size=64, max_rows=48)
 out = plan.run(q, swa_cache, swa_indices, swa_lengths, idx_cache, idx_indices, idx_lengths, idx_page_table, sinks)
 ```
 
-The default tile is 32 heads by 32 entries with 256 threads, about 70 KiB of
+Fewer chunks per segment give small batches more CTAs. More chunks per
+segment write fewer partial states: the decode workspace holds one
+512-wide FP32 state per segment, which costs more memory traffic than the
+records themselves when segments are a single chunk.
+
+The default tile is 32 heads by 32 entries with 256 threads, about 90 KiB of
 shared memory. At TP3 a rank owns 24 heads, which fit one 32-head block.
-`block_H=16, threads=128` doubles the decode CTAs per row. `block_H=64,
-block_I=16` serves the 64 heads of TP1 in one block (a 64x32 tile exceeds
-99 KiB); two 32-head blocks also work.
+`block_H=64, block_I=16` serves the 64 heads of TP1 in one block (a 64x32
+tile exceeds 99 KiB); two 32-head blocks also work.
 
 ## Indexer and top-k
 
@@ -108,6 +128,25 @@ positions by their maximum (the block holding the last visible position
 always survives) and expands them. This is the candidate-domain selection at
 V4.1's candidate source layer.
 
+## Expert dispatch and combine
+
+V4.1 Flash routes each token to 6 of 384 experts (the drafter: 3 of 128).
+`moe_dispatch_v41` takes the router's `topk_idx` (int64 from TileKernels or
+int32 from vLLM, `-1` for padding tokens) and groups the routes by expert in
+the contiguous layout of grouped GEMMs, as in DeepGEMM's
+`m_grouped_*_contiguous`: each expert's routes are consecutive, in route
+order, and padded to a multiple of `block_M`. Besides the route at each
+layout row and each route's layout row, it writes the expert of every
+`block_M` tile, with `-1` past the last used tile, so a grouped GEMM with a
+fixed grid can stop early.
+
+A route's rank within its expert comes from warp match masks and per-warp
+counts, so the layout is a pure function of `topk_idx`. Up to 512 routes
+take one CTA; larger batches count per 512-route chunk, scan, and scatter.
+`moe_combine_v41` sums each token's expert outputs, weighted, in slot order,
+and can add the shared expert's output. `MoeDispatchV41Plan` sizes the
+buffers for `max_rows`, so both steps can be captured in a CUDA graph.
+
 ## Block-scaled GEMMs
 
 V4.1 Flash stores dense weights as E4M3 with one UE8M0 scale per 32x32 block,
@@ -132,17 +171,20 @@ CUDA 13.0.2, `sm_121a`. Times are per call, from CUDA-graph replay of ten
 back-to-back calls, which is how decode runs in serving. Eager calls add about
 20 us of host launch overhead each.
 
-| Sparse MLA, 24 heads, SWA 128 + indexed 512 | `decode` | `extend` |
-|---|---:|---:|
-| 1 row | 7.6 us | 66 us |
-| 2 rows | 8.4 us | 73 us |
-| 8 rows | 30 us | 72 us |
-| 16 rows | 99 us | 76 us |
-| 48 rows | 478 us | 75 us |
-| 64 rows | 631 us | 138 us |
+| Sparse MLA, 24 heads, SWA 128 + indexed 512 | Plan's kernel | Time |
+|---|---|---:|
+| 1 row | `decode`, 16-head blocks | 11.5 us |
+| 4 rows | `decode`, 16-head blocks | 12.3 us |
+| 8 rows | `decode` | 14.8 us |
+| 16 rows | `decode` | 27.8 us |
+| 24 rows | `decode` | 43.2 us |
+| 32 rows | `extend` | 48.3 us |
+| 48 rows | `extend` | 50.5 us |
+| 64 rows | `extend` | 96.7 us |
 
-Both schedules give identical bits. The plan's default crossover is 8 rows.
-The max error against the FP32 reference is 0.002-0.008.
+Every kernel gives the same bits, and the outputs match an FP32 reference
+within the tests' tolerance (2e-2). With one chunk per segment the decode
+workspace dominates instead: `decode` takes 30 us at 8 rows and 97 us at 16.
 
 | Indexer, score + top-512, page 64 | Time |
 |---|---:|
@@ -165,6 +207,7 @@ For decode-sized M (6 to 48 rows), each GEMM projection takes 31-315 us.
 ```bash
 python sparse_mla_fwd_sm120.py --rows 8 --heads 24
 python indexer_sm120.py --rows 8 --context 32768
+python moe_dispatch_sm120.py --rows 48
 python mxfp8_gemm_sm120.py --projection wq_b
 python fp8_fp4_gemm_sm120.py
 python -m pytest test_tilelang_example_deepseek_v41.py
