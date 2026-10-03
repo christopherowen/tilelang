@@ -155,10 +155,16 @@ buffers for `max_rows`, so both steps can be captured in a CUDA graph.
 in one launch, over the dispatch layout. Each `block_M` tile multiplies by
 its expert's MXFP4 weights; the grid covers the plan's fixed tile count and
 unused tiles exit at once, so the launch can be captured in a CUDA graph. A
-two-stage pipeline loads the next K block while the current one multiplies:
-the expert's weights by TMA into unpacked FP4 shared memory, and (for the
-gate/up projection) each row's token, gathered through the layout, by
-`cp.async`. The down projection reads rows already in layout order.
+pipeline loads the next K blocks while the current one multiplies: the
+expert's weights by TMA into unpacked FP4 shared memory, and the activation
+rows (gathered through the layout for the gate/up projection) by `cp.async`.
+
+Two things keep decode close to the memory bandwidth. Weights are stored
+tile-major (`tile_expert_weights`, done once at load time), so every TMA box
+is one contiguous slab instead of `block_N` scattered 64-byte pieces. And
+padding rows, which make up nearly every row of a tile when an expert
+receives one or two tokens, are zero-filled without a memory read and never
+stored.
 
 `MoeExpertsV41Plan` chains a routed-expert layer: TileKernels' router,
 dispatch, TileKernels' MXFP8 cast of the tokens, the gate/up projection,
@@ -218,14 +224,14 @@ workspace dominates instead: `decode` takes 30 us at 8 rows and 97 us at 16.
 
 | Grouped expert GEMMs, TP3, 384 experts, top-6 | Experts used | Gate/up 1536x5120 | Down 5120x768 |
 |---|---:|---:|---:|
-| 8 tokens | 46 | 950 us (190 GB/s) | 481 us (188 GB/s) |
-| 16 tokens | 85 | 1719 us (194 GB/s) | 873 us (191 GB/s) |
-| 48 tokens | 204 | 4094 us (196 GB/s) | 2095 us (191 GB/s) |
-| 4096 tokens | 384 | 8802 us | 5851 us |
+| 8 tokens | 46 | 812 us (223 GB/s) | 393 us (230 GB/s) |
+| 16 tokens | 85 | 1469 us (228 GB/s) | 712 us (235 GB/s) |
+| 48 tokens | 204 | 3525 us (228 GB/s) | 1719 us (233 GB/s) |
+| 4096 tokens | 384 | 7989 us | 5577 us |
 
 Decode is bound by reading the used experts' FP4 weights; the bandwidths
-above count those bytes only. Decode uses 32x64 tiles with a four-deep
-pipeline; 4096 tokens use two stages.
+count those bytes only (GB10 peaks at 273 GB/s). All rows use 32x128 tiles,
+tile-major weights and a three-deep pipeline.
 
 | GEMM, M = 4096 | TFLOP/s |
 |---|---:|

@@ -10,10 +10,13 @@ tile exit immediately.
 
 - ``gather=True`` (the gate/up projection) reads each layout row's token
   through ``order``: row ``i`` of tile ``t`` is route ``order[t * block_M + i]``,
-  token ``route // topk``. The rows and their scale words are gathered with
-  ``cp.async``; padding rows read token 0 and are never consumed.
+  token ``route // topk``.
 - ``gather=False`` (the down projection) reads rows already in layout order,
   such as the output of TileKernels' ``swiglu_forward_and_per_token_cast``.
+
+Rows and their scale words arrive by ``cp.async``. Padding rows are
+zero-filled without a memory read and never stored: at decode most experts
+receive one or two tokens, so nearly every row of a tile is padding.
 
 Each output row depends only on its own token and expert, so the result does
 not depend on how many other tokens share the tile.
@@ -40,9 +43,6 @@ from fp8_fp4_gemm_sm120 import dequantize_mxfp4, quantize_mxfp4
 from moe_dispatch_sm120 import MoeDispatchV41Plan, make_routes
 from mxfp8_gemm_sm120 import SF_BLOCK, SF_WORD_K, dequantize, pack_scale_words, quantize_mxfp8
 
-# Batches above this many tokens use the shallower prefill pipeline.
-PREFILL_ROWS = 256
-
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def grouped_fp8_fp4_gemm(
@@ -52,9 +52,10 @@ def grouped_fp8_fp4_gemm(
     topk: int = 6,
     gather: bool = True,
     block_M: int = 32,
-    block_N: int = 64,
+    block_N: int = 128,
     block_K: int = 128,
-    num_stages: int = 4,
+    num_stages: int = 3,
+    tiled: bool = False,
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
 ):
@@ -62,6 +63,8 @@ def grouped_fp8_fp4_gemm(
 
     ``A``: ``[rows, K]`` E4M3 with packed UE8M0 words ``SFA[rows, K / 128]``;
     ``B``: ``[experts, N, K]`` E2M1 (packed bytes) with ``SFB[experts, N, K / 128]``.
+    With ``tiled=True``, ``B`` and ``SFB`` are in the tile-major layout of
+    ``tile_expert_weights``, so each tile's weights and scales are contiguous.
 
     A ``num_stages``-deep pipeline loads the next K blocks while the current
     one multiplies: the expert's weights by TMA, the gathered activation rows
@@ -79,37 +82,57 @@ def grouped_fp8_fp4_gemm(
     sfa_copies = tilelang.cdiv(block_M * block_words, threads)
     stages = num_stages
     assert stages >= 2
+    assert N % block_N == 0, "N must be a multiple of block_N"
+    n_blocks = N // block_N
+    b_shape = (num_experts * n_blocks * k_blocks, block_N, block_K) if tiled else (num_experts, N, K)
+    sfb_shape = (num_experts * n_blocks * k_blocks, block_N, block_words) if tiled else (num_experts, N, sf_words)
+    sfb_vec = 4 if (block_N * block_words) % 4 == 0 else 1  # words per cp.async of tiled scales
 
     @T.macro
     def load(A, SFA, B, SFB, A_shared, B_shared, SFA_shared, SFB_shared, a_row, sfa_row, loaded, expert, bx, t, tx, ko, s):
-        T.tma_copy(B[expert, bx * block_N, ko * block_K], B_shared[s, :, :], barrier=loaded[s])
-        if gather:
-            for c in T.unroll(a_copies):
-                e = c * threads + tx
-                if e < a_segments:
-                    T.ptx_cp_async(
-                        T.access_ptr(A_shared[s, e // (block_K // 16), e % (block_K // 16) * 16], "w", 16),
-                        T.access_ptr(A[a_row[c], ko * block_K + e % (block_K // 16) * 16], "r", 16),
-                        16,
-                    )
+        if tiled:
+            tile = (expert * n_blocks + bx) * k_blocks + ko
+            T.tma_copy(B[tile : tile + 1, 0:block_N, 0:block_K], B_shared[s : s + 1, :, :], barrier=loaded[s])
         else:
-            T.tma_copy(A[t * block_M : (t + 1) * block_M, ko * block_K : (ko + 1) * block_K], A_shared[s, :, :], barrier=loaded[s])
+            T.tma_copy(B[expert, bx * block_N, ko * block_K], B_shared[s, :, :], barrier=loaded[s])
+        # Padding rows (row -1) are zero-filled without reading memory.
+        for c in T.unroll(a_copies):
+            e = c * threads + tx
+            if e < a_segments:
+                T.ptx_cp_async(
+                    T.access_ptr(A_shared[s, e // (block_K // 16), e % (block_K // 16) * 16], "w", 16),
+                    T.access_ptr(A[T.max(a_row[c], 0), ko * block_K + e % (block_K // 16) * 16], "r", 16),
+                    16,
+                    a_row[c] >= 0,
+                )
         for c in T.unroll(sfa_copies):
             e = c * threads + tx
             if e < block_M * block_words:
                 T.ptx_cp_async(
                     T.access_ptr(SFA_shared[s, e // block_words, e % block_words], "w", 1),
-                    T.access_ptr(SFA[sfa_row[c], ko * block_words + e % block_words], "r", 1),
+                    T.access_ptr(SFA[T.max(sfa_row[c], 0), ko * block_words + e % block_words], "r", 1),
                     1,
+                    sfa_row[c] >= 0,
                 )
-        for c in T.unroll(tilelang.cdiv(block_N * block_words, threads)):
-            e = c * threads + tx
-            if e < block_N * block_words:
-                T.ptx_cp_async(
-                    T.access_ptr(SFB_shared[s, e // block_words, e % block_words], "w", 1),
-                    T.access_ptr(SFB[expert, bx * block_N + e // block_words, ko * block_words + e % block_words], "r", 1),
-                    1,
-                )
+        if tiled:
+            tile = (expert * n_blocks + bx) * k_blocks + ko
+            for c in T.unroll(tilelang.cdiv(block_N * block_words // sfb_vec, threads)):
+                e = (c * threads + tx) * sfb_vec
+                if e < block_N * block_words:
+                    T.ptx_cp_async(
+                        T.access_ptr(SFB_shared[s, e // block_words, e % block_words], "w", sfb_vec),
+                        T.access_ptr(SFB[tile, e // block_words, e % block_words], "r", sfb_vec),
+                        sfb_vec,
+                    )
+        else:
+            for c in T.unroll(tilelang.cdiv(block_N * block_words, threads)):
+                e = c * threads + tx
+                if e < block_N * block_words:
+                    T.ptx_cp_async(
+                        T.access_ptr(SFB_shared[s, e // block_words, e % block_words], "w", 1),
+                        T.access_ptr(SFB[expert, bx * block_N + e // block_words, ko * block_words + e % block_words], "r", 1),
+                        1,
+                    )
         T.ptx_commit_group()
         T.barrier_arrive(loaded[s])
 
@@ -117,8 +140,8 @@ def grouped_fp8_fp4_gemm(
     def main(
         A: T.Tensor((a_rows, K), T.float8_e4m3fn),
         SFA: T.Tensor((a_rows, sf_words), T.uint32),
-        B: T.Tensor((num_experts, N, K), T.float4_e2m1fn),
-        SFB: T.Tensor((num_experts, N, sf_words), T.uint32),
+        B: T.Tensor(b_shape, T.float4_e2m1fn),
+        SFB: T.Tensor(sfb_shape, T.uint32),
         Order: T.Tensor((tiles * block_M,), T.int32),
         TileExpert: T.Tensor((tiles,), T.int32),
         C: T.Tensor((tiles * block_M, N), out_dtype),
@@ -139,7 +162,8 @@ def grouped_fp8_fp4_gemm(
             if expert < 0:
                 T.thread_return()
             for i in T.Parallel(block_M):
-                rows_shared[i] = T.max(Order[t * block_M + i], 0) // topk if gather else t * block_M + i
+                route = Order[t * block_M + i]
+                rows_shared[i] = T.if_then_else(route >= 0, route // topk if gather else t * block_M + i, -1)
             T.sync_threads()
             # Each thread copies the same rows at every K block.
             for c in T.unroll(a_copies):
@@ -194,7 +218,10 @@ def grouped_fp8_fp4_gemm(
                     sf_a_granularity_k=SF_BLOCK,
                     sf_b_granularity_k=SF_BLOCK,
                 )
-            T.copy(C_local, C[t * block_M, bx * block_N])
+            # Only real rows are stored; padding rows of the layout stay untouched.
+            for i, j in T.Parallel(block_M, block_N):
+                if rows_shared[i] >= 0:
+                    C[t * block_M + i, bx * block_N + j] = C_local[i, j]
 
     return main
 
@@ -230,27 +257,28 @@ class MoeExpertsV41Plan:
 
     ``w13`` is ``[experts, 2 * intermediate, hidden]`` E2M1 bytes, gate rows
     first, with packed scale words ``w13_sf``; ``w2`` is
-    ``[experts, hidden, intermediate]`` with ``w2_sf``.
+    ``[experts, hidden, intermediate]`` with ``w2_sf``. ``prepare_weights``
+    converts them once to the tile-major layout the GEMMs read.
     """
 
-    def __init__(self, num_experts, topk, hidden, intermediate, *, max_rows, block_M=32, block_N=64, swiglu_limit=10.0,
-                 routed_scaling_factor=1.5, use_tile_kernels=True, device="cuda"):  # fmt: skip
+    def __init__(self, num_experts, topk, hidden, intermediate, *, max_rows, block_M=32, block_N=128, block_K=128, num_stages=3,
+                 swiglu_limit=10.0, routed_scaling_factor=1.5, use_tile_kernels=True, device="cuda"):  # fmt: skip
         self.topk, self.swiglu_limit, self.routed_scaling_factor = topk, swiglu_limit, routed_scaling_factor
         self.dispatch = MoeDispatchV41Plan(num_experts, topk, block_M, hidden, max_rows=max_rows, device=device)
         rows = self.dispatch.tiles * block_M
-        # Decode streams expert weights and wants a deep pipeline; prefill has many more tiles in flight.
-        self.depths = sorted({4, 2} if max_rows > PREFILL_ROWS else {4})
-        self.gate_up = {
-            d: grouped_fp8_fp4_gemm(num_experts, 2 * intermediate, hidden, topk, True, block_M, block_N, num_stages=d) for d in self.depths
-        }
-        self.down = {
-            d: grouped_fp8_fp4_gemm(num_experts, hidden, intermediate, topk, False, block_M, block_N, num_stages=d) for d in self.depths
-        }
+        self.block_N, self.block_K = block_N, block_K
+        config = dict(block_N=block_N, block_K=block_K, num_stages=num_stages, tiled=True)
+        self.gate_up = grouped_fp8_fp4_gemm(num_experts, 2 * intermediate, hidden, topk, True, block_M, **config)
+        self.down = grouped_fp8_fp4_gemm(num_experts, hidden, intermediate, topk, False, block_M, **config)
         self.h = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device=device)
         self.y = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
         self.tk = _tile_kernels() if use_tile_kernels else None
         if self.tk is not None:
             self.tk.config.set_token_alignment(block_M)
+
+    def prepare_weights(self, w13, w13_sf, w2, w2_sf):
+        """Tile-major copies of the expert weights and scale words, made once at load time."""
+        return (*tile_expert_weights(w13, w13_sf, self.block_N, self.block_K), *tile_expert_weights(w2, w2_sf, self.block_N, self.block_K))
 
     def route(self, logits, bias):
         if self.tk is not None:
@@ -259,15 +287,15 @@ class MoeExpertsV41Plan:
         return idx.contiguous(), weights.contiguous()
 
     def run(self, x, logits, bias, w13, w13_sf, w2, w2_sf, shared=None):
+        """One layer, with weights from ``prepare_weights``."""
         idx, weights = self.route(logits, bias)
         layout = self.dispatch.dispatch(idx, weights)
-        depth = 4 if x.shape[0] <= PREFILL_ROWS else 2
         if self.tk is not None:
             xq, x_sf = self.tk.quant.per_token_cast(x, "e4m3", SF_BLOCK, round_sf=True, use_packed_ue8m0=True)
         else:
             xq, x_exp = quantize_mxfp8(x)
             x_sf = pack_scale_words(x_exp)
-        self.gate_up[depth](xq, x_sf.view(torch.uint32), w13, w13_sf, layout["order"], layout["tile_expert"], self.h)
+        self.gate_up(xq, x_sf.view(torch.uint32), w13, w13_sf, layout["order"], layout["tile_expert"], self.h)
         if self.tk is not None:
             hq, h_sf = self.tk.quant.swiglu_forward_and_per_token_cast(
                 self.h, "e4m3", SF_BLOCK, layout["psum"], layout["layout_weights"],
@@ -275,7 +303,7 @@ class MoeExpertsV41Plan:
             )  # fmt: skip
         else:
             hq, h_sf = ref_swiglu_cast(self.h, layout["layout_weights"], layout["order"] >= 0, self.swiglu_limit)
-        self.down[depth](hq, h_sf.view(torch.uint32), w2, w2_sf, layout["order"], layout["tile_expert"], self.y)
+        self.down(hq, h_sf.view(torch.uint32), w2, w2_sf, layout["order"], layout["tile_expert"], self.y)
         return self.dispatch.combine(self.y, shared=shared)
 
 
@@ -294,6 +322,20 @@ def make_expert_weights(num_experts, N, K, seed=1, device="cuda"):
         exps.append(sfb)
         words.append(pack_scale_words(sfb))
     return torch.stack(packed), torch.stack(words), torch.stack(exps)
+
+
+def tile_expert_weights(b_packed, b_words, block_N, block_K):
+    """Tile-major copies of ``[E, N, K / 2]`` weights and ``[E, N, K / 128]`` scale words.
+
+    Tile ``(e, n, k)`` (``block_N`` rows by ``block_K`` columns) becomes one
+    contiguous ``[block_N, block_K / 2]`` slab, at index
+    ``(e * N / block_N + n) * K / block_K + k``.
+    """
+    E, N, half_k = b_packed.shape
+    K = 2 * half_k
+    b = b_packed.view(E, N // block_N, block_N, K // block_K, block_K // 2).permute(0, 1, 3, 2, 4)
+    w = b_words.view(E, N // block_N, block_N, K // block_K, block_K // SF_WORD_K).permute(0, 1, 3, 2, 4)
+    return b.reshape(-1, block_N, block_K // 2).contiguous(), w.reshape(-1, block_N, block_K // SF_WORD_K).contiguous()
 
 
 def ref_grouped(a, sfa, b_exps, b_packed, layout_rows, layout_expert):
@@ -340,6 +382,14 @@ def test_grouped_fp8_fp4_gemm(rows=16, num_experts=16, topk=6, N=256, K=512, blo
     c2 = torch.empty_like(c)
     kernel2(a_layout, sfa_layout, b_packed.view(torch.int8), b_words, layout["order"], layout["tile_expert"], c2)
     assert torch.equal(c2[: order.numel()][valid], c[: order.numel()][valid]), "gather and layout-order inputs differ"
+
+    # Tile-major weights give the same bits.
+    bn, bk = config.get("block_N", 128), config.get("block_K", 128)
+    b_tiled, w_tiled = tile_expert_weights(b_packed.view(torch.int8), b_words, bn, bk)
+    kernel3 = grouped_fp8_fp4_gemm(num_experts, N, K, topk, True, block_M, **{**config, "tiled": True})
+    c3 = torch.empty_like(c)
+    kernel3(a, pack_scale_words(sfa), b_tiled, w_tiled, layout["order"], layout["tile_expert"], c3)
+    assert torch.equal(c3[: order.numel()][valid], c[: order.numel()][valid]), "tiled and row-major weights differ"
     print(f"rows={rows} experts={num_experts} topk={topk} N={N} K={K} block_M={block_M} {config}: OK")
 
 
@@ -353,7 +403,7 @@ def test_moe_experts_v41(rows=12, num_experts=32, topk=6, hidden=512, intermedia
     w13, w13_sf, w13_exp = make_expert_weights(num_experts, 2 * intermediate, hidden, seed=2)
     w2, w2_sf, w2_exp = make_expert_weights(num_experts, hidden, intermediate, seed=3)
     plan = MoeExpertsV41Plan(num_experts, topk, hidden, intermediate, max_rows=rows, block_M=block_M, use_tile_kernels=use_tile_kernels)
-    out = plan.run(x, logits, bias, w13.view(torch.int8), w13_sf, w2.view(torch.int8), w2_sf).clone()
+    out = plan.run(x, logits, bias, *plan.prepare_weights(w13.view(torch.int8), w13_sf, w2.view(torch.int8), w2_sf)).clone()
 
     idx, weights = plan.route(logits, bias)
     xq, x_exp = quantize_mxfp8(x)
@@ -372,21 +422,23 @@ def test_moe_experts_v41(rows=12, num_experts=32, topk=6, hidden=512, intermedia
           f"tile_kernels={plan.tk is not None}: OK")  # fmt: skip
 
 
-def benchmark(rows, num_experts=384, topk=6, N=1536, K=5120, block_M=32, backend="cudagraph", **config):
+def benchmark(rows, num_experts=384, topk=6, N=1536, K=5120, block_M=32, gather=True, backend="cudagraph", **config):
     device = "cuda"
     idx, weights = make_routes(rows, num_experts, topk)
     plan = MoeDispatchV41Plan(num_experts, topk, block_M, 1024, max_rows=rows)
     layout = plan.dispatch(idx, weights)
-    a, sfa = quantize_mxfp8(torch.randn((rows, K), device=device))
+    a, sfa = quantize_mxfp8(torch.randn((rows if gather else plan.tiles * block_M, K), device=device))
     b_packed = torch.randint(-128, 127, (num_experts, N, K // 2), dtype=torch.int8, device=device)
     b_words = torch.randint(0x78787878, 0x7A7A7A7A, (num_experts, N, K // SF_WORD_K), dtype=torch.int32, device=device).view(torch.uint32)
-    kernel = grouped_fp8_fp4_gemm(num_experts, N, K, topk, True, block_M, **config)
+    if config.get("tiled"):
+        b_packed, b_words = tile_expert_weights(b_packed, b_words, config.get("block_N", 128), config.get("block_K", 128))
+    kernel = grouped_fp8_fp4_gemm(num_experts, N, K, topk, gather, block_M, **config)
     c = torch.empty((plan.tiles * block_M, N), dtype=torch.bfloat16, device=device)
     words_a = pack_scale_words(sfa)
     ms = do_bench(lambda: kernel(a, words_a, b_packed, b_words, layout["order"], layout["tile_expert"], c), backend=backend)
     used = int((layout["expert_count"] > 0).sum())
     weight_bytes = used * N * K // 2
-    print(f"rows={rows} experts used={used}/{num_experts} N={N} K={K} block_M={block_M} [{backend}]: {ms * 1e3:.1f} us, "
+    print(f"rows={rows} experts used={used}/{num_experts} N={N} K={K} block_M={block_M} {config} [{backend}]: {ms * 1e3:.1f} us, "
           f"{weight_bytes / ms * 1e-6:.0f} GB/s of expert weights")  # fmt: skip
     return ms
 
