@@ -263,7 +263,9 @@ def moe_dispatch_v41(num_experts: int, topk: int, block_M: int, part: str = "fus
 def moe_combine_v41(hidden: int, topk: int, shared: bool = False, weighted: bool = False, block_D: int = 1024, threads: int = 128):
     """``Out[t] = sum_k [Weights[t, k] *] Y[RoutePos[t, k]] (+ Shared[t])``, FP32 in slot order, BF16 out."""
     rows, layout_rows = T.dynamic("rows, layout_rows")
-    assert hidden % block_D == 0
+    while hidden % block_D:
+        block_D //= 2
+    assert block_D >= 8, f"hidden={hidden} must be a multiple of 8"
 
     @T.prim_func
     def main(

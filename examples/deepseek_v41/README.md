@@ -13,6 +13,7 @@ deepseek_v41/
 ├── sparse_mla_fwd_sm120.py      # sparse MLA over the SWA (MXFP8) and indexed (NVFP4) caches
 ├── indexer_sm120.py             # indexer scores over the MXFP4 index cache, exact top-k
 ├── moe_dispatch_sm120.py        # routed-expert dispatch to the grouped layout, and combine
+├── moe_expert_gemm_sm120.py     # grouped routed-expert GEMMs and a whole routed-expert layer
 ├── mxfp8_gemm_sm120.py          # block-32 FP8 linear: MXFP8 x MXFP8
 ├── fp8_fp4_gemm_sm120.py        # routed-expert linear: MXFP8 x MXFP4
 ├── test_tilelang_example_deepseek_v41.py
@@ -29,12 +30,13 @@ deepseek_v41/
 | Block-32 FP8 projections (query, KV, output, shared expert, Engram) | `mxfp8_gemm_sm120.py` | `mma.sync.m16n8k32.kind::mxf8f6f4.block_scale` E4M3 x E4M3 |
 | Routed experts, one expert's projection | `fp8_fp4_gemm_sm120.py` | `mma.sync.m16n8k32.kind::mxf8f6f4.block_scale` E4M3 x E2M1 |
 | Routed experts, dispatch and combine | `moe_dispatch_sm120.py` | warp match masks, ordered weighted sums |
+| Routed experts, all experts at once | `moe_expert_gemm_sm120.py` | TMA weights, `cp.async` row gather, `kind::mxf8f6f4` E4M3 x E2M1 |
 | Manifold hyper-connections (4 streams) | `../deepseek_mhc` | architecture-neutral; use `hc_mult=4`, hidden 5120, 20 Sinkhorn iterations |
 | Activation quantization | `../deepseek_v4/act_quant.py` | architecture-neutral |
 
-Expert selection itself (sqrt-softplus scores, biased top-k, normalized
-weights) is TileKernels' `moe_topk_gate_forward`. The grouped expert launch
-is not included.
+Expert selection (sqrt-softplus scores, biased top-k, normalized weights)
+and the fused SwiGLU-and-cast between the two expert projections come from
+DeepSeek's TileKernels, which runs on SM121 with these changes.
 
 ## Sparse MLA
 
@@ -147,6 +149,26 @@ take one CTA; larger batches count per 512-route chunk, scan, and scatter.
 and can add the shared expert's output. `MoeDispatchV41Plan` sizes the
 buffers for `max_rows`, so both steps can be captured in a CUDA graph.
 
+## Grouped expert GEMMs
+
+`grouped_fp8_fp4_gemm` runs one routed-expert projection for every expert
+in one launch, over the dispatch layout. Each `block_M` tile multiplies by
+its expert's MXFP4 weights; the grid covers the plan's fixed tile count and
+unused tiles exit at once, so the launch can be captured in a CUDA graph. A
+two-stage pipeline loads the next K block while the current one multiplies:
+the expert's weights by TMA into unpacked FP4 shared memory, and (for the
+gate/up projection) each row's token, gathered through the layout, by
+`cp.async`. The down projection reads rows already in layout order.
+
+`MoeExpertsV41Plan` chains a routed-expert layer: TileKernels' router,
+dispatch, TileKernels' MXFP8 cast of the tokens, the gate/up projection,
+TileKernels' clamped SwiGLU with the route weights and MXFP8 cast, the down
+projection, and the combine. As in DeepSeek's kernels, the route weight is
+applied before the down projection, so the combine is a plain sum.
+TileKernels' packed row-major UE8M0 scales are exactly the scale words the
+GEMMs read. Without TileKernels, PyTorch stands in for the router and the
+casts.
+
 ## Block-scaled GEMMs
 
 V4.1 Flash stores dense weights as E4M3 with one UE8M0 scale per 32x32 block,
@@ -194,6 +216,17 @@ workspace dominates instead: `decode` takes 30 us at 8 rows and 97 us at 16.
 | 48 rows, 32768 positions | 365 us |
 | 1 row, 131072 positions | 37.3 us |
 
+| Grouped expert GEMMs, TP3, 384 experts, top-6 | Experts used | Gate/up 1536x5120 | Down 5120x768 |
+|---|---:|---:|---:|
+| 8 tokens | 46 | 950 us (190 GB/s) | 481 us (188 GB/s) |
+| 16 tokens | 85 | 1719 us (194 GB/s) | 873 us (191 GB/s) |
+| 48 tokens | 204 | 4094 us (196 GB/s) | 2095 us (191 GB/s) |
+| 4096 tokens | 384 | 8802 us | 5851 us |
+
+Decode is bound by reading the used experts' FP4 weights; the bandwidths
+above count those bytes only. Decode uses 32x64 tiles with a four-deep
+pipeline; 4096 tokens use two stages.
+
 | GEMM, M = 4096 | TFLOP/s |
 |---|---:|
 | MXFP8, query/KV/shared/output projections | 101-140 |
@@ -208,6 +241,7 @@ For decode-sized M (6 to 48 rows), each GEMM projection takes 31-315 us.
 python sparse_mla_fwd_sm120.py --rows 8 --heads 24
 python indexer_sm120.py --rows 8 --context 32768
 python moe_dispatch_sm120.py --rows 48
+python moe_expert_gemm_sm120.py --rows 16
 python mxfp8_gemm_sm120.py --projection wq_b
 python fp8_fp4_gemm_sm120.py
 python -m pytest test_tilelang_example_deepseek_v41.py

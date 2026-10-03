@@ -3,6 +3,7 @@ import tilelang.testing
 import fp8_fp4_gemm_sm120
 import indexer_sm120
 import moe_dispatch_sm120
+import moe_expert_gemm_sm120
 import mxfp8_gemm_sm120
 import sparse_mla_fwd_sm120
 
@@ -85,6 +86,16 @@ def test_example_moe_dispatch():
     moe_dispatch_sm120.test_moe_dispatch_v41(rows=48)
     moe_dispatch_sm120.test_moe_dispatch_v41(rows=300, pad_rows=17, skew=4.0)
     moe_dispatch_sm120.test_moe_dispatch_v41(rows=40, num_experts=128, topk=3)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(12, 0)
+@tilelang.testing.requires_cuda_compute_version_lt(13, 0)
+def test_example_moe_expert_gemm():
+    # Gathered and layout-order inputs, then a whole routed-expert layer (PyTorch stands in for TileKernels).
+    moe_expert_gemm_sm120.test_grouped_fp8_fp4_gemm(rows=16, num_experts=16, N=256, K=512)
+    moe_expert_gemm_sm120.test_grouped_fp8_fp4_gemm(rows=40, num_experts=24, N=256, K=512, block_M=64, block_N=128, num_stages=2)
+    moe_expert_gemm_sm120.test_moe_experts_v41(rows=12, use_tile_kernels=False)
 
 
 if __name__ == "__main__":
