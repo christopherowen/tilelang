@@ -616,8 +616,9 @@ class TensorCoreIntrinEmitterSM120(MMAIntrinEmitter):
         if sf_layout not in ("rowmajor", "blockscaled_chunk_kmajor"):
             raise ValueError(f"Unsupported SM120 scale layout: {sf_layout}")
 
-        # Compact selector packages are read from shared memory; other scale scopes keep the per-MMA path below.
-        if is_shared(SFA_data) and is_shared(SFB_data):
+        # Compact selector packages consume a full scale word (scale_vec::4X).
+        # Other modes need per-K-atom byte selectors and keep the per-MMA path.
+        if self.scale_vec_size == 4 and is_shared(SFA_data) and is_shared(SFB_data):
             return self._mma_with_compact_scale_packages(
                 A_local_buf,
                 B_local_buf,
