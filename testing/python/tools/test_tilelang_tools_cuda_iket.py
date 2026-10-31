@@ -37,6 +37,7 @@ def _isolated_iket_state():
     _remove_cuda_postproc()
     iket.reset()
     iket.disable_runtime_payloads()
+    iket.set_instrument_method(None)
 
     yield
 
@@ -46,6 +47,7 @@ def _isolated_iket_state():
         iket.disable(restore=False)
     iket.reset()
     iket.disable_runtime_payloads()
+    iket.set_instrument_method(None)
     _remove_cuda_postproc()
     if previous is not None:
         tvm_ffi.register_global_func(_CUDA_POSTPROC, f=previous, override=True)
@@ -113,12 +115,41 @@ def _iket_calls(func) -> list[tvm.tirx.Call]:
 
 
 def _event_metadata_bytes(source: str, event_name: str) -> list[int]:
+    safe_name = re.sub(r"[^0-9A-Za-z_]", "_", event_name)
     declaration = re.search(
-        rf"__iket_evt_decl_{re.escape(event_name)}_\d+_attrs\[60\]\s*=\s*\{{([^}}]+)\}};",
+        rf"__iket_evt_decl_{re.escape(safe_name)}_\d+_attrs\[60\]\s*=\s*\{{([^}}]+)\}};",
         source,
     )
     assert declaration is not None
     return [int(value.strip()) for value in declaration.group(1).split(",")]
+
+
+def _range_metadata_bytes(source: str, range_name: str) -> list[int]:
+    safe_name = re.sub(r"[^0-9A-Za-z_]", "_", range_name)
+    declaration = re.search(
+        rf"__iket_range_decl_{re.escape(safe_name)}_\d+_attrs\[72\]\s*=\s*\{{([^}}]+)\}};",
+        source,
+    )
+    assert declaration is not None
+    return [int(value.strip()) for value in declaration.group(1).split(",")]
+
+
+def _meta_info_bytes(source: str) -> list[int]:
+    declaration = re.search(
+        r"__iket_meta_info\[48\]\s*=\s*\{([^}]+)\};",
+        source,
+    )
+    assert declaration is not None
+    return [int(value.strip()) for value in declaration.group(1).split(",")]
+
+
+def _u32_le(data: list[int], offset: int) -> int:
+    return (
+        data[offset]
+        | (data[offset + 1] << 8)
+        | (data[offset + 2] << 16)
+        | (data[offset + 3] << 24)
+    )
 
 
 def test_iket_is_a_cuda_tool_not_a_language_namespace():
@@ -354,3 +385,227 @@ def test_failed_non_overriding_session_restores_host_state(tmp_path):
     assert iket.runtime_payloads_enabled() == original_runtime_payloads
     restored = tvm_ffi.get_global_func(_CUDA_POSTPROC)
     assert restored("kernel source", tvm.target.Target(_SM90_TARGET)) == "kernel source"
+
+
+@pytest.mark.parametrize(
+    ("dtype_alias", "expected_dtype", "expected_id"),
+    [
+        ("i8", "int8", int(iket.PayloadType.I8)),
+        ("uint8", "uint8", int(iket.PayloadType.UI8)),
+        ("i16", "int16", int(iket.PayloadType.I16)),
+        ("u16", "uint16", int(iket.PayloadType.UI16)),
+        ("int32", "int32", int(iket.PayloadType.I32)),
+        ("uint32", "uint32", int(iket.PayloadType.UI32)),
+        ("i64", "int64", int(iket.PayloadType.I64)),
+        ("u64", "uint64", int(iket.PayloadType.UI64)),
+        ("fp4", "float4", int(iket.PayloadType.FP4)),
+        ("float8_e4m3fn", "float8", int(iket.PayloadType.FP8)),
+        ("fp16", "float16", int(iket.PayloadType.FP16)),
+        ("bf16", "bfloat16", int(iket.PayloadType.BF16)),
+        ("float32", "float32", int(iket.PayloadType.FP32)),
+        ("fp64", "float64", int(iket.PayloadType.FP64)),
+        ("ptr", "pointer", int(iket.PayloadType.POINTER)),
+    ],
+)
+def test_extended_payload_dtypes_and_iket_ids(dtype_alias, expected_dtype, expected_id):
+    spec = iket.payload(1, dtype=dtype_alias)
+    assert spec.dtype == expected_dtype
+    assert spec.iket_id == expected_id
+
+
+@tilelang.testing.requires_cuda
+def test_extended_payload_macros_and_64bit_stores():
+    @T.prim_func
+    def kernel(
+        A: T.Tensor((1,), T.float16),
+        B: T.Tensor((1,), T.bfloat16),
+        C: T.Tensor((1,), T.int64),
+        D: T.Tensor((1,), T.float64),
+    ):
+        with T.Kernel(1, threads=32):
+            iket.mark("val_f16", payload=iket.payload(A[0], dtype="float16"))
+            iket.mark("val_bf16", payload=iket.payload(B[0], dtype="bfloat16"))
+            iket.mark("val_i64", payload=iket.payload(C[0], dtype="int64"))
+            iket.mark("val_f64", payload=iket.payload(D[0], dtype="float64"))
+            iket.mark("val_ptr", payload=iket.payload(C[0], dtype="pointer"))
+            A[0] = A[0]
+
+    with iket.session(runtime_payloads=True):
+        source = _lower_cuda_source(kernel)
+
+    assert _u32_le(_event_metadata_bytes(source, "val_f16"), 12) == int(iket.PayloadType.FP16)
+    assert _u32_le(_event_metadata_bytes(source, "val_bf16"), 12) == int(iket.PayloadType.BF16)
+    assert _u32_le(_event_metadata_bytes(source, "val_i64"), 12) == int(iket.PayloadType.I64)
+    assert _u32_le(_event_metadata_bytes(source, "val_f64"), 12) == int(iket.PayloadType.FP64)
+    assert _u32_le(_event_metadata_bytes(source, "val_ptr"), 12) == int(iket.PayloadType.POINTER)
+    assert "TL_IKET_EVENT_PAYLOAD_F16" in source
+    assert "TL_IKET_EVENT_PAYLOAD_BF16" in source
+    assert "TL_IKET_EVENT_PAYLOAD_U64" in source
+    assert "TL_IKET_EVENT_PAYLOAD_F64" in source
+    assert "TL_IKET_EVENT_PAYLOAD_PTR" in source
+    assert "st.volatile.shared.u64 [r], p;" in source
+
+
+@tilelang.testing.requires_cuda
+def test_start_end_range_single_event_and_non_lifo_interleaving():
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), T.float32)):
+        with T.Kernel(1, threads=32):
+            iket.range_start("stage_a")
+            iket.range_start("stage_b")
+            A[0] = A[0]
+            iket.range_end("stage_a")
+            iket.range_end("stage_b")
+
+    with iket.session():
+        source = _lower_cuda_source(kernel)
+
+    evt_a = _event_metadata_bytes(source, "stage_a")
+    evt_b = _event_metadata_bytes(source, "stage_b")
+    rng_a = _range_metadata_bytes(source, "stage_a")
+    rng_b = _range_metadata_bytes(source, "stage_b")
+
+    assert _u32_le(evt_a, 16) == int(iket.EventPos.RANGE_START_END)
+    assert _u32_le(evt_b, 16) == int(iket.EventPos.RANGE_START_END)
+    assert _u32_le(rng_a, 16) == int(iket.RangeType.START_END)
+    assert _u32_le(rng_b, 16) == int(iket.RangeType.START_END)
+    assert _u32_le(rng_a, 20) == int(iket.EventPairMode.NAME_ONLY)
+    assert "__iket_evt_decl_stage_a_end" not in source
+
+
+@tilelang.testing.requires_cuda
+def test_start_end_range_with_dual_payloads_scope_pair_mode_and_color():
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=32):
+            with iket.range(
+                "pipe_stage",
+                payload=iket.payload(A[0], dtype="int32"),
+                end_payload=iket.payload(A[0], dtype="int32"),
+                scope="cta",
+                pair_mode="name_and_payload",
+                color="cyan",
+            ):
+                A[0] = A[0]
+
+    with iket.session(runtime_payloads=True):
+        source = _lower_cuda_source(kernel)
+
+    evt_start = _event_metadata_bytes(source, "pipe_stage")
+    evt_end = _event_metadata_bytes(source, "pipe_stage:end")
+    rng = _range_metadata_bytes(source, "pipe_stage")
+
+    assert _u32_le(evt_start, 16) == int(iket.EventPos.RANGE_START)
+    assert _u32_le(evt_end, 16) == int(iket.EventPos.RANGE_END)
+    assert _u32_le(evt_start, 20) == _u32_le(evt_end, 20) == _u32_le(rng, 8)
+    assert _u32_le(evt_start, 12) == int(iket.PayloadType.I32)
+    assert _u32_le(evt_end, 12) == int(iket.PayloadType.I32)
+    assert _u32_le(rng, 4) == int(iket.RangeScope.INTER_WARP_IN_CTA)
+    assert _u32_le(rng, 12) == int(iket.Colors.CYAN)
+    assert _u32_le(rng, 16) == int(iket.RangeType.START_END)
+    assert _u32_le(rng, 20) == int(iket.EventPairMode.NAME_AND_PAYLOAD)
+
+    # Without runtime_payloads=True, NAME_AND_PAYLOAD automatically falls back to NAME_ONLY
+    with iket.session(runtime_payloads=False):
+        source_no_payload = _lower_cuda_source(kernel)
+    rng_no_payload = _range_metadata_bytes(source_no_payload, "pipe_stage")
+    assert _u32_le(rng_no_payload, 20) == int(iket.EventPairMode.NAME_ONLY)
+
+
+@tilelang.testing.requires_cuda
+def test_multi_event_range_with_range_step():
+    @T.prim_func
+    def kernel(A: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=32):
+            with iket.range("tma_transfer"):
+                iket.range_step("tma_transfer", "tma_arrive", payload=iket.payload(A[0], dtype="int32"))
+                A[0] = A[0]
+
+    with iket.session(runtime_payloads=True):
+        source = _lower_cuda_source(kernel)
+
+    evt_start = _event_metadata_bytes(source, "tma_transfer")
+    evt_step = _event_metadata_bytes(source, "tma_arrive")
+    evt_end = _event_metadata_bytes(source, "tma_transfer:end")
+    rng = _range_metadata_bytes(source, "tma_transfer")
+
+    assert _u32_le(rng, 16) == int(iket.RangeType.MULTI_EVENT)
+    assert _u32_le(rng, 20) == int(iket.EventPairMode.NAME_ONLY)
+    assert _u32_le(evt_start, 16) == int(iket.EventPos.RANGE_START)
+    assert _u32_le(evt_step, 16) == int(iket.EventPos.RANGE_INTERNAL)
+    assert _u32_le(evt_end, 16) == int(iket.EventPos.RANGE_END)
+    assert _u32_le(evt_start, 20) == _u32_le(evt_step, 20) == _u32_le(evt_end, 20)
+
+
+@tilelang.testing.requires_cuda
+def test_extended_native_dump_auto_and_explicit():
+    def _emit_many_marks(count: int) -> None:
+        for idx in range(count):
+            T.evaluate(iket.mark(f"evt_{idx:02d}"))
+
+    @T.prim_func
+    def many_events_kernel(A: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=32):
+            _emit_many_marks(35)
+            A[0] = A[0]
+
+    with iket.session():
+        source = _lower_cuda_source(many_events_kernel)
+
+    meta = _meta_info_bytes(source)
+    assert _u32_le(meta, 8) == 35
+    assert _u32_le(meta, 12) == 4095
+    assert _u32_le(meta, 32) == 64 + 34
+
+    first_evt = _event_metadata_bytes(source, "evt_00")
+    last_evt = _event_metadata_bytes(source, "evt_34")
+    assert _u32_le(first_evt, 4) == 64
+    assert _u32_le(first_evt, 8) == int(iket.InstrumentMethod.EXTENDED_NATIVE_DUMP)
+    assert _u32_le(last_evt, 4) == 98
+    assert "st.weak.shared.u64 [r], ts_evtid;" in source
+
+    with (
+        pytest.raises(ValueError, match="supports at most 30 events"),
+        iket.session(instrument_method="native_dump"),
+    ):
+        _lower_cuda_source(many_events_kernel)
+
+    with iket.session(instrument_method="extended", runtime_payloads=True):
+        explicit_source = _lower_cuda_source(_make_float_payload_kernel())
+    explicit_evt = _event_metadata_bytes(explicit_source, "float_value")
+    assert _u32_le(explicit_evt, 4) == 64
+    assert _u32_le(explicit_evt, 8) == int(iket.InstrumentMethod.EXTENDED_NATIVE_DUMP)
+    assert "mad.lo.u32 r, r, 0x1000000, 0x28;" in explicit_source
+
+
+def test_profile_command_extended_options():
+    default_cmd = iket.profile_command(["python", "run.py"], directory="/tmp/iket_out")
+    assert default_cmd == (
+        "python -m iket.cli.main --output-dir /tmp/iket_out --clobber "
+        "profile --postprocess all -- python run.py"
+    )
+
+    extended_cmd = iket.profile_command(
+        ["python", "run.py"],
+        directory="/tmp/iket_out",
+        postprocess="json",
+        context_buffer_size=256,
+        log_level="info",
+        working_dir="/tmp/iket_work",
+        max_ts_cnt_per_warp=8192,
+        use_tracker_dir="/tmp/iket_tracker",
+        use_config="/tmp/iket_cfg.yaml",
+        config_version="v1",
+        warp_trace=True,
+        keep=False,
+    )
+    assert "--context-buffer-size 256" in extended_cmd
+    assert "--log-level info" in extended_cmd
+    assert "--working-dir /tmp/iket_work" in extended_cmd
+    assert "profile --postprocess json" in extended_cmd
+    assert "--max-ts-cnt-per-warp 8192" in extended_cmd
+    assert "--use-tracker-dir /tmp/iket_tracker" in extended_cmd
+    assert "--use-config /tmp/iket_cfg.yaml" in extended_cmd
+    assert "--config-version v1" in extended_cmd
+    assert "--no-keep" in extended_cmd
+    assert "--warp-trace" in extended_cmd

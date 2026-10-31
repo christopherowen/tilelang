@@ -60,12 +60,40 @@ def profile_command(
     directory: str | os.PathLike[str],
     postprocess: str = "all",
     clobber: bool = True,
+    context_buffer_size: int | str | None = None,
+    log_level: str | None = None,
+    working_dir: str | os.PathLike[str] | None = None,
+    max_ts_cnt_per_warp: int | None = None,
+    use_tracker_dir: str | os.PathLike[str] | None = None,
+    use_config: str | os.PathLike[str] | None = None,
+    config_version: str | None = None,
+    warp_trace: bool = False,
+    keep: bool | None = None,
 ) -> str:
     """Build an IKET CLI command that exports traces to ``directory``."""
     parts = ["python", "-m", "iket.cli.main", "--output-dir", str(Path(directory).expanduser())]
     if clobber:
         parts.append("--clobber")
-    parts.extend(["profile", "--postprocess", postprocess, "--"])
+    if context_buffer_size is not None:
+        parts.extend(["--context-buffer-size", str(context_buffer_size)])
+    if log_level is not None:
+        parts.extend(["--log-level", str(log_level)])
+    if working_dir is not None:
+        parts.extend(["--working-dir", str(Path(working_dir).expanduser())])
+    parts.extend(["profile", "--postprocess", postprocess])
+    if max_ts_cnt_per_warp is not None:
+        parts.extend(["--max-ts-cnt-per-warp", str(int(max_ts_cnt_per_warp))])
+    if use_tracker_dir is not None:
+        parts.extend(["--use-tracker-dir", str(Path(use_tracker_dir).expanduser())])
+    if use_config is not None:
+        parts.extend(["--use-config", str(Path(use_config).expanduser())])
+    if config_version is not None:
+        parts.extend(["--config-version", str(config_version)])
+    if keep is not None:
+        parts.append("--keep" if keep else "--no-keep")
+    if warp_trace:
+        parts.append("--warp-trace")
+    parts.append("--")
     command_prefix = " ".join(shlex.quote(str(item)) for item in parts)
     if isinstance(command, str):
         return f"{command_prefix} {command}"

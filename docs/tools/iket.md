@@ -108,29 +108,59 @@ iket.range_push("compute")
 iket.range_pop("compute")
 ```
 
-`iket.range_start(...)` and `iket.range_end(...)` are aliases for
-`range_push(...)` and `range_pop(...)`. A range start can carry a payload, but
-the range-end event cannot.
+For overlapping or software-pipelined lifetimes, start/end payload pairs, or
+cross-warp producer-consumer events, use `START_END` ranges via
+`iket.range_start(...)` and `iket.range_end(...)` (or `iket.range(...)` with
+`range_type="start_end"`, `end_payload=...`, `pair_mode=...`, or `scope=...`):
 
-IKET records ranges at warp granularity. A block containing four warps can
+```python
+iket.range_start(
+    "tma_stage",
+    payload=iket.payload(stage, dtype="int32"),
+    scope="cta",
+    pair_mode="name_and_payload",
+    color="cyan",
+)
+# Producer / consumer statements across warps or pipeline stages
+iket.range_end(
+    "tma_stage",
+    payload=iket.payload(stage, dtype="int32"),
+)
+```
+
+Supported range scopes (`iket.RangeScope` or string alias):
+
+- `"intra_warp"` / `"warp"` (default)
+- `"inter_warp_in_cta"` / `"cta"` / `"block"`
+- `"inter_warp_in_sm"` / `"sm"`
+- `"inter_warp_in_tpc"` / `"tpc"`
+- `"inter_warp_in_gpc"` / `"gpc"`
+
+Use `iket.range_step(range_name, step_name=..., payload=...)` inside a range to
+emit internal `MULTI_EVENT` checkpoints (`EventPos.RANGE_INTERNAL`).
+
+IKET records events at warp granularity. A block containing four warps can
 therefore produce four trace ranges for one lexical `iket.range(...)` scope.
-Names are limited to 32 UTF-8 bytes. Reusing the same marker or range name with
-different payload dtypes in one frontend registry is rejected.
+Event names are limited to 32 UTF-8 bytes (range names up to 36 UTF-8 bytes).
+Reusing the same marker or range name with different payload dtypes in one
+frontend registry is rejected.
 
 ## Runtime Payloads
 
-Markers and range starts can capture one 32-bit scalar value. TileLang currently
-supports these payload dtypes:
+Markers, range starts, range steps, and `START_END` range ends can capture one
+scalar or pointer payload value. TileLang supports all 15 IKET payload dtypes:
 
-- `int32`
-- `uint32`
-- `float32`
+- Signed integers: `int8`, `int16`, `int32`, `int64`
+- Unsigned integers: `uint8`, `uint16`, `uint32`, `uint64`
+- Floating-point: `float4`, `float8`, `float16`, `bfloat16`, `float32`, `float64`
+- Addresses / handles: `pointer` (`ptr`, `handle`)
 
 Use an explicit payload descriptor for TileLang expressions:
 
 ```python
 iket.mark("store_index", payload=iket.payload(i, dtype="int32"))
 iket.mark("scale", payload=iket.payload(value, dtype="float32"))
+iket.mark("smem_ptr", payload=iket.payload(addr, dtype="pointer"))
 ```
 
 Simple Python scalars and expressions with a `dtype` attribute can be passed
@@ -165,6 +195,7 @@ with iket.session(
     disable_on_exit=True,
     output_dir=None,
     runtime_payloads=None,
+    instrument_method=None,
     disable_cache=True,
 ):
     ...
@@ -183,6 +214,10 @@ The parameters control the following state:
   TileLang's IKET path helpers for the duration of the session.
 - `runtime_payloads` temporarily selects whether payload values are emitted.
   `None` preserves the previous setting.
+- `instrument_method` selects `"auto"` (`None`, default), `"native_dump"`,
+  `"extended"` (`ExtendedNativeDump`), or `"utrace"`. In `"auto"` mode, modules
+  with up to 30 events use `NativeDump` (IDs `1..30`) and modules with 31 to
+  4,031 events automatically promote to `ExtendedNativeDump` (IDs `64..4094`).
 - `disable_cache` bypasses TileLang's `KernelCache` by default and restores its
   previous state when the session exits.
 
@@ -358,8 +393,9 @@ record shape that the current external IKET patcher does not accept.
 ## Limitations
 
 - Only the TileLang CUDA backend is supported.
-- Runtime payloads are limited to `int32`, `uint32`, and `float32`.
-- Event and range names are limited to 32 UTF-8 bytes.
+- Modules support up to 30 events with `NativeDump` and up to 4,031 events with
+  `ExtendedNativeDump` (selected automatically when a module exceeds 30 events).
+- Event names are limited to 32 UTF-8 bytes (range names up to 36 UTF-8 bytes).
 - Source-code location tables are not generated. Trace `locIdx` values are IKET
   runtime location indices, not Python or TIR line numbers.
 - IKET records events at warp granularity.

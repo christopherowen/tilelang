@@ -11,8 +11,9 @@ import tvm_ffi
 from tilelang.env import CacheState, disable_cache, enable_cache
 
 from .cli import _restore_output_dir, _snapshot_output_dir, set_output_dir
-from .codegen import inject_iket_cuda
+from .codegen import inject_iket_cuda, parse_instrument_method
 from .frontend import reset
+from .metadata import InstrumentMethod
 
 
 _CUDA_POSTPROC = "tilelang_callback_cuda_postproc"
@@ -20,6 +21,7 @@ _state_lock = threading.RLock()
 _enable_depth = 0
 _previous_cuda_postproc = None
 _runtime_payloads_enabled = False
+_instrument_method: str | int | InstrumentMethod | None = None
 
 
 def enable_runtime_payloads() -> None:
@@ -42,8 +44,28 @@ def runtime_payloads_enabled() -> bool:
         return _runtime_payloads_enabled
 
 
+def set_instrument_method(method: str | int | InstrumentMethod | None) -> None:
+    """Set the IKET instrument method (`None`/`"auto"`, `"native_dump"`, or `"extended"`)."""
+    global _instrument_method
+    if method is not None:
+        parse_instrument_method(method)
+    with _state_lock:
+        _instrument_method = method
+
+
+def get_instrument_method() -> str | int | InstrumentMethod | None:
+    """Return the configured IKET instrument method override, if any."""
+    with _state_lock:
+        return _instrument_method
+
+
 def _cuda_postproc(code: str, target: Any) -> str:
-    return inject_iket_cuda(code, target, runtime_payloads=runtime_payloads_enabled())
+    return inject_iket_cuda(
+        code,
+        target,
+        runtime_payloads=runtime_payloads_enabled(),
+        instrument_method=get_instrument_method(),
+    )
 
 
 def enable(*, override: bool = True) -> None:
@@ -93,17 +115,22 @@ class _Session:
         disable_on_exit: bool = True,
         output_dir: str | os.PathLike[str] | None = None,
         runtime_payloads: bool | None = None,
+        instrument_method: str | int | InstrumentMethod | None = None,
         disable_cache: bool = True,
     ):
+        if instrument_method is not None:
+            parse_instrument_method(instrument_method)
         self.reset_events = reset_events
         self.override = override
         self.disable_on_exit = disable_on_exit
         self.output_dir = output_dir
         self.runtime_payloads = runtime_payloads
+        self.instrument_method = instrument_method
         self.disable_cache = disable_cache
         self._previous_output_dir = None
         self._previous_env_output_dir = None
         self._previous_runtime_payloads = False
+        self._previous_instrument_method = None
         self._previous_cache_enabled = False
         self._entered = False
         self._enabled_by_session = False
@@ -113,6 +140,7 @@ class _Session:
             raise RuntimeError("An IKET session object cannot be entered more than once at a time")
         self._previous_output_dir, self._previous_env_output_dir = _snapshot_output_dir()
         self._previous_runtime_payloads = runtime_payloads_enabled()
+        self._previous_instrument_method = get_instrument_method()
         self._previous_cache_enabled = CacheState.is_enabled()
         try:
             if self.output_dir is not None:
@@ -122,6 +150,8 @@ class _Session:
                     enable_runtime_payloads()
                 else:
                     disable_runtime_payloads()
+            if self.instrument_method is not None:
+                set_instrument_method(self.instrument_method)
             if self.disable_cache:
                 disable_cache()
             enable(override=self.override)
@@ -155,6 +185,7 @@ class _Session:
             enable_runtime_payloads()
         else:
             disable_runtime_payloads()
+        set_instrument_method(self._previous_instrument_method)
         if self.disable_cache:
             if self._previous_cache_enabled:
                 enable_cache()
@@ -169,6 +200,7 @@ def session(
     disable_on_exit: bool = True,
     output_dir: str | os.PathLike[str] | None = None,
     runtime_payloads: bool | None = None,
+    instrument_method: str | int | InstrumentMethod | None = None,
     disable_cache: bool = True,
 ) -> _Session:
     """Configure IKET around kernel construction and compilation."""
@@ -178,5 +210,6 @@ def session(
         disable_on_exit=disable_on_exit,
         output_dir=output_dir,
         runtime_payloads=runtime_payloads,
+        instrument_method=instrument_method,
         disable_cache=disable_cache,
     )
